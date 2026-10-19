@@ -2,6 +2,10 @@
 
 Physics-Informed Neural Networks for predicting the thermal structure, velocity field, and pressure field of subducting slabs. The model embeds mass conservation, energy conservation, Stokes momentum conservation, and boundary/initial conditions into the loss function, fusing observed data with physical laws.
 
+## Demo
+
+**[Online Demo (Streamlit)](https://pinn-subduction-futwhyg4pztd7yxmqcjq2c.streamlit.app/)**
+
 ## Language & Framework
 
 - **Language**: Python 3.11
