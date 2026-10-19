@@ -1,6 +1,6 @@
 # Slab-PINN
 
-Physics-Informed Neural Networks for predicting the thermal structure of subducting slabs. The model embeds mass conservation, energy conservation, and boundary/initial conditions into the loss function, fusing observed data with physical laws.
+Physics-Informed Neural Networks for predicting the thermal structure, velocity field, and pressure field of subducting slabs. The model embeds mass conservation, energy conservation, Stokes momentum conservation, and boundary/initial conditions into the loss function, fusing observed data with physical laws.
 
 ## Language & Framework
 
@@ -34,7 +34,12 @@ TempHeat{T}Age{A}Vel{V}.{step}
 - `{step}`: time-step index (0 – 15000, step 50)
 
 Input columns: `x, z, time, heat_flow, dip, age, velocity` (7-dim).
-Output: temperature (normalized to [0, 1], i.e. 0–1320 K) and two velocity components.
+Output columns (space-separated within each record): `T, Vx, Vz, P, Vi` — temperature, two velocity components, pressure, and pointwise relative viscosity. The network predicts the first 4 channels (`T, Vx, Vz, P`); `Vi` is only used by the Stokes momentum residual, not a prediction target.
+
+Normalization (see `dataset/NNDataset.py`):
+- `T`: clipped to [0, 1320] K, then / 1320
+- `Vx, Vz`: symmetric scaling by the plate velocity → [0, 1]
+- `P`: symmetric scaling `Pn = P / (2 * P_SCALE) + 0.5` with `P_SCALE = 1.2e12` Pa (dataset-specific; rescan `Dat_uniP` extremes when using new simulation data)
 
 ### Directory Layout
 
@@ -60,36 +65,49 @@ data/fnn/
 ### Training
 
 ```bash
-# PINN with adaptive weights (recommended)
+# PINN with default loss weights (alpha=beta=gamma=delta=epsilon=1.0)
 python train_pifnn.py
 
-# Pure FNN (no physics constraints)
-python train_fnn.py
+# Train several weight configurations in one run (alpha,beta,gamma,delta,epsilon)
+python train_pifnn.py --weights 1.0,1.0,1.0,1.0,1.0 1.0,1.0,1.0,1.0,1e-8 1.0,1.0,1.0,1.0,1e-12
 
-# Other architectures
-python train_dcnn.py     # Deep Convolutional Generator
-python train_aenn.py     # Autoencoder + NN
-python train_gan.py      # GAN
-python train_nn.py       # Basic NN
+# Also run test-set evaluation after each configuration
+python train_pifnn.py --weights 1.0,1.0,1.0,1.0,1e-8 --test
 ```
+
+### Loss Weights
+
+Passed via `--weights` (order: `alpha,beta,gamma,delta,epsilon`):
+
+| Weight | Loss term |
+|--------|-----------|
+| `alpha` | Mass conservation (incompressibility) residual |
+| `beta` | Energy conservation (thermal advection-diffusion) residual |
+| `gamma` | Initial condition (t = 0 thermal structure) |
+| `delta` | Boundary condition (top/bottom temperature) |
+| `epsilon` | Stokes momentum residual (pressure gradient vs. viscous stress) |
+
+Each configuration's checkpoints and logs are written to `./result/` with the weights encoded in the filename, e.g. `pifnn_1.0_1.0_1.0_1.0_1e-08.pth`, `pifnn_1.0_1.0_1.0_1.0_1e-08_trainingData.txt`, so multiple runs never overwrite each other.
+
+> Note: the raw momentum residual is of order ~1e7 in `(Pa/m)^2`, much larger than the data MSE. Sweep `epsilon` over small values (e.g. 1e-8 to 1e-12) and check the logged momentum component.
 
 ### Key Parameters
 
-Edit the top of `train_pifnn.py`:
+Edit `train()` in `train_pifnn.py`:
 
 ```python
 learning_rate = 5e-4
 batch_size = 128
 epoch = 5
-adapt_mode = 'gradnorm'          # 'gradnorm' | 'fixed' | 'dynamic'
-gradnorm_update_freq = 100       # weight update frequency (steps)
-gradnorm_alpha = 0.1             # GradNorm exponent
-gradnorm_min_weight = 1e-4
-gradnorm_max_weight = 1e16
 ```
 
-- `adapt_mode='gradnorm'`: dynamically balances data / mass / energy / IC / BC loss terms via gradient norm matching.
-- `adapt_mode='fixed'`: uses constant weights `initial_alpha/beta/gamma/delta`.
+### Data Conversion
+
+`dataset/GenerateProcessData.py` converts raw simulation output (`origin_*` directories with `Dat_uniT/XV/ZV/P/Vi` files) into the training format:
+
+```python
+split_fnn5(tag="train_20260831_p", target_tag="train_20260831")
+```
 
 ### Output
 
@@ -98,20 +116,15 @@ Trained checkpoints are saved to `./result/` (e.g. `pifnn_*.pth`).
 ## Project Structure
 
 ```
-PINN/
-├── model/                 # Network definitions (FNN, DCNN, AE, LSTM, ...)
-├── dataset/               # Dataset loaders and data generation
-├── data/fnn/              # Data directory (train/valid/test)
-├── train_pifnn.py         # Main PINN training script
-├── train_fnn.py           # FNN training
-├── train_dcnn.py          # DCNN training
-├── train_aenn.py          # Autoencoder + NN
-├── train_gan.py           # GAN
-├── train_nn.py            # Basic NN
-├── generate_boundary.py   # Boundary condition & gradient utilities
-├── generate_tempfile.py   # Export temperature field (GMT format)
-└── plot1NN.sh             # GMT plotting script
+slab-pinn/
+├── model/                 # Network definitions (FNN, ConvAE)
+├── dataset/               # Dataset loaders (NNDataset.py) and data conversion (GenerateProcessData.py)
+├── data/fnn/              # Data directory (train/valid/test), not tracked
+├── train_pifnn.py         # Main PINN training script (7 inputs -> 4 outputs: T, Vx, Vz, P)
+└── README.md
 ```
+
+The training script expects to run from a directory containing `data/fnn/` and `generate_boundary.py` (boundary condition & autograd gradient utilities).
 
 ## License
 

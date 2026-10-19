@@ -11,6 +11,13 @@ import torch
 T_MIN = 0.0
 T_MAX = 1320.0
 
+# 压力场定标常数，单位 Pa。origin_20260831 全局压力范围约 -1.18e12 ~ +6.7e7 Pa
+# 归一化：Pn = P/(2*P_SCALE) + 0.5，反归一化：P = (Pn-0.5)*2*P_SCALE
+P_SCALE = 1.2e12
+
+# 参考粘度，单位 Pa·s。原始 Dat_uniVi 为无量纲相对粘度（地表约为1），物理粘度 mu = Vi * VISCOSITY_0
+VISCOSITY_0 = 1.0e21
+
 # 时间模拟步数间隔
 STEP_SIZE = 50
 SINGLE_LENGTH = int(15000 / 50 + 1)
@@ -50,14 +57,16 @@ class NNDataset(Dataset):
 
 
 class FNNDataset(Dataset):
-    def __init__(self, root_dir: str, tag: str, nx: int = 111, nz: int = 101, output_index_start: int = 0, output_index_end: int = 3):
+    def __init__(self, root_dir: str, tag: str, nx: int = 111, nz: int = 101, output_index_start: int = 0, output_index_end: int = 4, with_viscosity: bool = False):
         """
         初始化数据集加载
         :param root_dir: 数据集根目录
         :param tag: 当前加载数据集标签
+        :param with_viscosity: 是否额外返回逐点粘度（output 第5列 Vi，用于Stokes动量残差）
         """
         self.output_index_start = output_index_start
         self.output_index_end = output_index_end
+        self.with_viscosity = with_viscosity
         self.root_dir = root_dir
         self.data_dir = f"{root_dir}/{tag}"
         self.input_data = os.listdir(f"{self.data_dir}/input")
@@ -67,7 +76,7 @@ class FNNDataset(Dataset):
         """
         获取单一数据
         :param item: 目标数据索引
-        :return: item索引对应的一组数据
+        :return: 默认返回 (输入, 输出[start:end], 文件名)；with_viscosity=True 时追加逐点粘度
         """
         file_index, data_index = divmod(item, self.single_num)
         input_file = f"{self.data_dir}/input/{self.input_data[file_index]}"
@@ -95,8 +104,15 @@ class FNNDataset(Dataset):
         # 对速度场进行归一化，方便训练收敛
         output_data[1] = (output_data[1] * np.sqrt(2.0) / input_data[6] + 1.0) / 2.0
         output_data[2] = (output_data[2] * np.sqrt(2.0) / input_data[6] + 1.0) / 2.0
+        # 对压力场进行对称定标，映射到 0~1 附近（压力可为负，不能像温度一样截断）
+        output_data[3] = output_data[3] / (2.0 * P_SCALE) + 0.5
         # print(output_data)
-        return torch.from_numpy(input_data).float(), torch.from_numpy(output_data[self.output_index_start:self.output_index_end]).float(), self.input_data[file_index]
+        target = torch.from_numpy(output_data[self.output_index_start:self.output_index_end]).float()
+        if self.with_viscosity:
+            # 第5列为原始无量纲粘度 Vi，不做归一化，物理粘度 = Vi * VISCOSITY_0
+            viscosity = torch.tensor(float(output_data[4]), dtype=torch.float32)
+            return torch.from_numpy(input_data).float(), target, self.input_data[file_index], viscosity
+        return torch.from_numpy(input_data).float(), target, self.input_data[file_index]
 
     def __len__(self):
         """
@@ -152,8 +168,10 @@ class FNNTestDataset(FNNDataset):
         # 对速度场进行归一化，方便训练收敛
         output_data[:, 1] = (output_data[:, 1] * np.sqrt(2.0) / input_data[:, 6][0] + 1.0) / 2.0
         output_data[:, 2] = (output_data[:, 2] * np.sqrt(2.0) / input_data[:, 6][0] + 1.0) / 2.0
+        # 对压力场进行对称定标
+        output_data[:, 3] = output_data[:, 3] / (2.0 * P_SCALE) + 0.5
         # print(output_data)
-        return torch.from_numpy(input_data).float(), torch.from_numpy(output_data).float(), self.input_data[item]
+        return torch.from_numpy(input_data).float(), torch.from_numpy(output_data[:, self.output_index_start:self.output_index_end]).float(), self.input_data[item]
 
 
     def __len__(self):

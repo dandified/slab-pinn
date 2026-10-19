@@ -1,6 +1,7 @@
 import math
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import shutil
 import tqdm
@@ -99,57 +100,78 @@ def copy_dataset_fnn(tag: str, data: list[str]):
                     wf.write(','.join(output_param))
 
 
+# 将单个模拟目录转换为 FNN 格式（线程池工作单元）
+def _convert_fnn2_one(orgin_data_path: str, final_dir: str, data_dirs: str):
+    data_files = os.listdir(f"{orgin_data_path}/{data_dirs}")
+    for data_file in data_files:
+        # 将输入输出分开
+        if "Elaps" in data_file:
+            data_path = f"{orgin_data_path}/{data_dirs}/{data_file}"
+            file_path = Path(data_path)
+            filename = file_path.name
+            name, ext = filename.split('.')
+
+            # 读取输入参数、速度、温度、压力和粘度
+            with open(
+                    f"{orgin_data_path}/{data_dirs}/Elaps.{ext}") as inputf:
+                input_params = inputf.read().replace(',', ' ')
+
+            with open(
+                    f"{orgin_data_path}/{data_dirs}/Dat_uniXV.{ext}") as xf:
+                xv = xf.readlines()
+            # 注意：z向速度必须读取 Dat_uniZV，早期版本误读为 Dat_uniXV，导致两个速度通道相同
+            with open(
+                    f"{orgin_data_path}/{data_dirs}/Dat_uniZV.{ext}") as zf:
+                zv = zf.readlines()
+
+            with open(
+                    f"{orgin_data_path}/{data_dirs}/Dat_uniT.{ext}") as tf:
+                T = tf.readlines()
+
+            with open(
+                    f"{orgin_data_path}/{data_dirs}/Dat_uniP.{ext}") as pf:
+                P = pf.readlines()
+
+            with open(
+                    f"{orgin_data_path}/{data_dirs}/Dat_uniVi.{ext}") as vif:
+                Vi = vif.readlines()
+
+            input_param = []
+            output_param = []
+
+            for i in range(len(T)):
+                # 拼接输入
+                Temperature = T[i].replace('\n', '').split(',')
+                X_Velocity = xv[i].replace('\n', '').split(',')
+                Z_Velocity = zv[i].replace('\n', '').split(',')
+                Pressure = P[i].replace('\n', '').split(',')
+                Viscosity = Vi[i].replace('\n', '').split(',')
+
+                input_param.append(f"{Temperature[0]} {Temperature[1]} {input_params}")
+                output_param.append(
+                    f"{Temperature[2]} {X_Velocity[2]} {Z_Velocity[2]} {Pressure[2]} {Viscosity[2]}")
+
+            with open(f"{final_dir}/input/{data_dirs}.{ext}", "wt", encoding="utf-8") as wf:
+                wf.write(','.join(input_param))
+
+            with open(f"{final_dir}/output/{data_dirs}.{ext}", "wt", encoding="utf-8") as wf:
+                wf.write(','.join(output_param))
+
+
 # 将数据集路径进行复制
-def copy_dataset_fnn2(tag: str, data: list[str], data_tag: str = "20260607"):
+# output 文件字段顺序：温度T、x向速度Vx、z向速度Vz、压力P、粘度Vi（粘度仅用于Stokes动量残差，不作为预测目标）
+def copy_dataset_fnn2(tag: str, data: list[str], data_tag: str = "20260607", max_workers: int = 8):
     # 创建文件夹
     orgin_data_path = f"{target_dir}/origin_{data_tag}"
     final_dir = f"{target_dir}/{tag}"
     os.makedirs(f"{final_dir}/input", exist_ok=True)
     os.makedirs(f"{final_dir}/output", exist_ok=True)
 
-    for data_dirs in data:
-        data_files = os.listdir(f"{orgin_data_path}/{data_dirs}")
-        for data_file in data_files:
-            # 将输入输出分开
-            if "Elaps" in data_file:
-                data_path = f"{orgin_data_path}/{data_dirs}/{data_file}"
-                file_path = Path(data_path)
-                filename = file_path.name
-                name, ext = filename.split('.')
-
-                # 读取速度和温度
-                with open(
-                        f"{orgin_data_path}/{data_dirs}/Elaps.{ext}") as inputf:
-                    input_params = inputf.read().replace(',', ' ')
-                    
-                with open(
-                        f"{orgin_data_path}/{data_dirs}/Dat_uniXV.{ext}") as xf:
-                    xv = xf.readlines()
-                with open(
-                        f"{orgin_data_path}/{data_dirs}/Dat_uniXV.{ext}") as zf:
-                    zv = zf.readlines()
-                    
-                with open(
-                        f"{orgin_data_path}/{data_dirs}/Dat_uniT.{ext}") as tf:
-                    T = tf.readlines()
-
-                input_param = []
-                output_param = []
-
-                for i in range(len(T)):
-                    # 拼接输入
-                    Temperature = T[i].replace('\n', '').split(',')
-                    X_Velocity = xv[i].replace('\n', '').split(',')
-                    Z_Velocity = zv[i].replace('\n', '').split(',')
-
-                    input_param.append(f"{Temperature[0]} {Temperature[1]} {input_params}")
-                    output_param.append(f"{Temperature[2]} {X_Velocity[2]} {Z_Velocity[2]}")
-
-                with open(f"{final_dir}/input/{data_dirs}.{ext}", "wt", encoding="utf-8") as wf:
-                    wf.write(','.join(input_param))
-
-                with open(f"{final_dir}/output/{data_dirs}.{ext}", "wt", encoding="utf-8") as wf:
-                    wf.write(','.join(output_param))
+    # IO 密集型转换，多线程并行处理各模拟目录，输出文件一一对应、内容确定
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_convert_fnn2_one, orgin_data_path, final_dir, d) for d in data]
+        for future in tqdm.tqdm(as_completed(futures), total=len(futures)):
+            future.result()
 
 # 将数据集路径进行复制
 def copy_dataset_lstm(tag: str, data: list[str]):
@@ -272,12 +294,18 @@ def split_fnn4():
     copy_dataset2("train", train_data)
 
 
-def split_fnn5():
-    tag = "20260721"
+def split_fnn5(tag: str = "20260831", target_tag: str = "train_20260831_p"):
+    """
+    将 origin_{tag} 下的全部模拟数据转换为 FNN/PINN 训练格式。
+    output 字段（5列）：温度T、x向速度Vx、z向速度Vz、压力P、粘度Vi（Vi仅用于动量PDE残差）。
+    :param tag: 原始数据目录日期标签，对应 origin_{tag}
+    :param target_tag: 转换输出目录标签，写入 {target_dir}/{target_tag}
+    """
     data = os.listdir(f"{target_dir}/origin_{tag}")
 
-    # 80%作为训练集
-    copy_dataset_fnn2(f"test_{tag}", data, tag)
+    print(f"原始数据：{target_dir}/origin_{tag}，共 {len(data)} 组模拟")
+    print(f"输出目录：{target_dir}/{target_tag}")
+    copy_dataset_fnn2(target_tag, data, tag)
 
 
 def generate_input():
@@ -465,6 +493,6 @@ if __name__ == "__main__":
     # split_fnn2()
     # split_fnn3()
     # split_fnn4()
-    # split_fnn5()
+    split_fnn5()
     
     # shutil.rmtree("D:\\GeoScience\\俯冲带与PINN\\俯冲板片\\train\\data\\fnn\\train")

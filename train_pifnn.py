@@ -1,7 +1,9 @@
+import argparse
 import uuid
 from tqdm import tqdm
 from model import FNN
 from dataset import FNNDataset, FNNTestDataset
+from dataset.NNDataset import P_SCALE, VISCOSITY_0
 import torch
 import os
 import numpy as np
@@ -17,102 +19,26 @@ ngpu = 1
 # Decide which device we want to run on
 device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
 root_dir = "./data/fnn"
+# 数据集标签（output 含 T/Vx/Vz/P 四个预测通道，第5列 Vi 为逐点粘度）
+data_tag = "train_20260831_p"
 workers = 2
 nx = 111
 nz = 101
 
 # 时间间隔常量
-time_constant = 1e13
-# 质量守恒方程单独缩放因子（使质量损失量级与能量损失接近）
-mass_scale = 1e24
-
-# 自适应权重模式: 'gradnorm' | 'fixed' | 'dynamic'
-adapt_mode = 'gradnorm'
-
-# 初始权重（仅在非fixed模式下作为初始值）
-# 注意：初始值不能为0，否则GradNorm会陷入零值陷阱
-initial_alpha = 1.0
-initial_beta = 1.0
-initial_gamma = 1.0
-initial_delta = 1.0
-
-# GradNorm 参数
-gradnorm_alpha = 0.1
-gradnorm_update_freq = 100
-gradnorm_min_weight = 1e-4
-gradnorm_max_weight = 1e16
+time_constant = 1.0
+# 损失权重默认值：alpha 质量守恒 / beta 能量守恒 / gamma 初始条件 / delta 边界条件 / epsilon Stokes 动量残差
+# 训练时以命令行 --weights 传入为准，此处仅作默认值及手动调用时的回退
+alpha = 1.0
+beta = 1.0
+gamma = 1.0
+delta = 1.0
+epsilon = 1.0
 
 
-class AdaptiveWeights:
-    def __init__(self, mode='gradnorm', initial_weights=None):
-        self.mode = mode
-        if initial_weights is None:
-            initial_weights = [initial_alpha, initial_beta, initial_gamma, initial_delta]
-        self.weights = torch.tensor(initial_weights, dtype=torch.float32, device=device)
-        self.weights.requires_grad = False
-        self.loss_history = []
-        self.grad_history = []
-        self.step_count = 0
-    
-    def get_weights(self):
-        return self.weights.detach().cpu().numpy()
-    
-    def compute_grad_norm(self, loss, model, retain_graph=True):
-        grads = torch.autograd.grad(loss, model.parameters(), create_graph=False, retain_graph=retain_graph)
-        grad_norm = torch.sqrt(sum(torch.sum(g ** 2) for g in grads if g is not None))
-        return grad_norm
-    
-    def update_gradnorm(self, loss_terms, model):
-        if self.mode != 'gradnorm':
-            return
-        
-        self.step_count += 1
-        if self.step_count % gradnorm_update_freq != 0:
-            return
-        
-        num_terms = len(loss_terms)
-        grad_norms = []
-        
-        for i, loss_term in enumerate(loss_terms):
-            if loss_term.item() > 0:
-                grad_norm = self.compute_grad_norm(loss_term, model)
-            else:
-                grad_norm = torch.tensor(0.0, device=device)
-            grad_norms.append(grad_norm)
-        
-        grad_norms = torch.stack(grad_norms)
-        avg_grad_norm = grad_norms.mean()
-        
-        grad_norm_threshold = 1e-20
-        new_weights = []
-        for i in range(num_terms):
-            if grad_norms[i] > grad_norm_threshold:
-                ratio = avg_grad_norm / grad_norms[i]
-                new_w = self.weights[i] * (ratio ** gradnorm_alpha)
-            else:
-                new_w = self.weights[i] * 10.0
-            new_w = torch.clamp(new_w, gradnorm_min_weight, gradnorm_max_weight)
-            new_weights.append(new_w)
-        
-        self.weights = torch.tensor(new_weights, dtype=torch.float32, device=device)
-        self.weights.requires_grad = False
-    
-    def update_dynamic(self, loss_terms):
-        if self.mode != 'dynamic':
-            return
-        
-        loss_values = torch.tensor([lt.item() for lt in loss_terms], device=device)
-        loss_sum = loss_values.sum()
-        
-        if loss_sum > 0:
-            self.weights = loss_sum / (len(loss_terms) * loss_values)
-            self.weights = torch.clamp(self.weights, gradnorm_min_weight, gradnorm_max_weight)
-    
-    def update(self, loss_terms, model=None):
-        if self.mode == 'gradnorm':
-            self.update_gradnorm(loss_terms, model)
-        elif self.mode == 'dynamic':
-            self.update_dynamic(loss_terms)
+def run_name_of(alpha: float, beta: float, gamma: float, delta: float, epsilon: float) -> str:
+    """该组权重对应的结果文件/目录名前缀"""
+    return f"pifnn_{alpha}_{beta}_{gamma}_{delta}_{epsilon}"
 
 
 # 计算初始条件，注意，热量需要乘0.001
@@ -169,7 +95,7 @@ def ic_loss(input_):
 # pde损失函数
 # 目前质量守恒方程量级在能量守恒方程的10%
 # 若beta偏大，会导致模型过拟合
-def pde_loss(input_, output_):
+def pde_loss(input_, output_, viscosity, alpha, beta, epsilon):
     # print(input_[:, 6])
     # print(output_[:, 1])
 
@@ -183,6 +109,10 @@ def pde_loss(input_, output_):
     T = output_[:, 0] * 1320.0  # 单位：K
     U = (output_[:, 1] * 2.0 - 1.0) * input_[:, 6] / np.sqrt(2.0) * 1e-10   # 单位：m/s
     V = (output_[:, 2] * 2.0 - 1.0) * input_[:, 6] / np.sqrt(2.0) * 1e-10   # 单位：m/s
+    # 压力反归一化，单位：Pa
+    P = (output_[:, 3] - 0.5) * 2.0 * P_SCALE
+    # 逐点动力粘度，单位：Pa·s（Dat_uniVi 为无量纲相对粘度，地表约为1）
+    mu = viscosity * VISCOSITY_0
 
     # print(U)
     # 距离单位从km转换为m
@@ -215,17 +145,39 @@ def pde_loss(input_, output_):
     # print(energy_residual)
     # energy_formula = U * gradient(T, input_)[0][:, 0] - gradient(T, input_)[0][:, 2] - gradient(T_t, input_)[0][:, 2]
 
-    # pde_l = alpha * torch.mean(mass_formula ** 2) + beta * torch.mean(energy_residual ** 2)
+    # Stokes 动量方程残差（不可压缩、低雷诺数，局部常粘度近似：忽略粘度空间导数项）
+    # Dat_uniP 为地表置零的动力压力（已扣除静岩压力），故不显式包含浮力项；坐标每求导一次除以1e3换算到m
+    # 残差单位：Pa/m
+    dP_dx = gradient(P, input_)[0][:, 0] / (1e3)
+    dP_dz = gradient(P, input_)[0][:, 1] / (1e3)
+
+    dU_dx_m = gradient(U, input_)[0][:, 0] / (1e3)
+    dU_dz_m = gradient(U, input_)[0][:, 1] / (1e3)
+    d2U_dx2 = gradient(dU_dx_m, input_)[0][:, 0] / (1e3)
+    d2U_dz2 = gradient(dU_dz_m, input_)[0][:, 1] / (1e3)
+
+    dV_dx_m = gradient(V, input_)[0][:, 0] / (1e3)
+    dV_dz_m = gradient(V, input_)[0][:, 1] / (1e3)
+    d2V_dx2 = gradient(dV_dx_m, input_)[0][:, 0] / (1e3)
+    d2V_dz2 = gradient(dV_dz_m, input_)[0][:, 1] / (1e3)
+
+    momentum_x = -dP_dx + mu * (d2U_dx2 + d2U_dz2)
+    momentum_z = -dP_dz + mu * (d2V_dx2 + d2V_dz2)
+    momentum_formula = torch.mean(momentum_x ** 2 + momentum_z ** 2)
+
+    pde_l = alpha * torch.mean(mass_formula ** 2) + beta * torch.mean(energy_residual ** 2) \
+        + epsilon * momentum_formula
 
     # print(f"PDE 损失：{pde_loss.item()}")
 
-    # 返回均方误差（质量守恒使用单独的缩放因子）
-    return torch.mean(mass_formula ** 2) * time_constant * mass_scale, torch.mean(energy_residual ** 2) * time_constant
+    # 返回均方误差（总体PDE损失，其中动量损失分量）
+    return pde_l * time_constant, epsilon * momentum_formula * time_constant
 
 
-# 训练函数入口
-def train():
+# 训练函数入口（权重经参数传入，一个脚本即可顺序完成多组权重的训练与验证）
+def train(alpha: float, beta: float, gamma: float, delta: float, epsilon: float):
     # 超参数
+    run_name = run_name_of(alpha, beta, gamma, delta, epsilon)
 
     # 训练参数
     epoch = 5
@@ -233,24 +185,21 @@ def train():
     minimum_validation_loss = 10000000000.0
     batch_size = 128
 
-    # 初始化自适应权重
-    adapt_weights = AdaptiveWeights(mode=adapt_mode)
-
     # 加载数据
     # model_path = f"./result/conv_ae_{middle_channels}_{final_channels}.pth"
-    model_path = f"./result/pifnn_{adapt_mode}.pth"
+    model_path = f"./result/{run_name}.pth"
 
     # 数据集
-    train_dataset = FNNDataset(root_dir, 'train', output_index_end=3)
-    valid_dataset = FNNDataset(root_dir, 'valid', output_index_end=3)
+    train_dataset = FNNDataset(root_dir, data_tag, output_index_end=4, with_viscosity=True)
+    valid_dataset = FNNDataset(root_dir, data_tag, output_index_end=4, with_viscosity=True)
 
     train_dataloader = DataLoader(train_dataset, batch_size, shuffle=True, num_workers=workers)
     valid_dataloader = DataLoader(valid_dataset, batch_size, shuffle=True, num_workers=workers)
 
     loss_fn = nn.MSELoss().to(device)
 
-    # 定义FNN网络
-    model = FNN(7, 3).to(device)
+    # 定义FNN网络：7个输入（x,z,t,H,dip,age,vel），4个输出（T,Vx,Vz,P）
+    model = FNN(7, 4).to(device)
 
     # Handle multi-GPU if desired
     if (device.type == 'cuda') and (ngpu > 1):
@@ -267,7 +216,6 @@ def train():
 
     training_loss_list = []
     validation_loss_list = []
-    weights_history = []
 
     try:
         # 训练循环
@@ -275,64 +223,52 @@ def train():
             # 训练
             training_loss = 0.0
             step = 0
-            for inputs, real_outputs, _ in train_dataloader:
+            for inputs, real_outputs, _, viscosity in train_dataloader:
                 inputs = inputs.to(device)
                 inputs.requires_grad = True
+                # print(inputs.size())
+                # print(inputs)
                 real_outputs = real_outputs.to(device)
-                
+                viscosity = viscosity.to(device)
+                # print(real_outputs)
                 model.zero_grad()
                 outputs = model(inputs)
+                # print(outputs.size())
+                # print(outputs)
+                pde, momentum = pde_loss(inputs, outputs, viscosity, alpha, beta, epsilon)
 
                 # 添加初始条件约束，令t=0
                 ic_real = ic_loss(inputs)
+                # print(ic_real)
+                # 我需要复制一个input，将其第3列时间项设为0
                 ic_inputs = inputs.clone()
                 ic_inputs[:, 2] = 0.0
+                # print(ic_inputs)
                 ic_outputs = model(ic_inputs)[:, 0]
-                
-                # 添加边界条件约束，令z=0和z=600的温度为0和1项设为0
+                # print(ic_outputs)
+                icLoss = loss_fn(ic_outputs, ic_real) * gamma
+
+                # print(icLoss)
+
+                # 添加边界条件约束，令z=0和z=600的温度为0和1
                 bc_inputs_top = inputs.clone()
                 bc_inputs_top[:, 1] = 0.0
                 bc_inputs_bottom = inputs.clone()
                 bc_inputs_bottom[:, 1] = 600.0
+                # print(ic_inputs)
                 bc_outputs_top = model(bc_inputs_top)[:, 0]
                 bc_outputs_bottom = model(bc_inputs_bottom)[:, 0]
-
+                
                 bc_real_top = torch.zeros(bc_outputs_top.size()).to(device)
                 bc_real_bottom = torch.ones(bc_outputs_bottom.size()).to(device)
+                
+                # print(bc_outputs_top)
+                # print(bc_outputs_bottom)
+                bcLoss = (loss_fn(bc_outputs_top, bc_real_top) + loss_fn(bc_outputs_bottom, bc_real_bottom)) * delta
 
-                # 计算各项损失（不带权重）
-                m_base, e_base = pde_loss(inputs, outputs)
-                print(f"  Mass Loss: {m_base.item()}")
-                print(f"  Energy Loss: {e_base.item()}")
-                icLoss_base = loss_fn(ic_outputs, ic_real)
-                bcLoss_base = loss_fn(bc_outputs_top, bc_real_top) + loss_fn(bc_outputs_bottom, bc_real_bottom)
-                print(f"  IC Loss: {icLoss_base.item()}")
-                print(f"  BC Loss: {bcLoss_base.item()}")
-                data_loss = loss_fn(outputs, real_outputs)
-
-                # 获取当前权重
-                w = adapt_weights.weights
-                alpha_w, beta_w, gamma_w, delta_w = w[0], w[1], w[2], w[3]
-
-                # 带权重的损失（用于计算梯度范数）
-                m_weighted = m_base * alpha_w
-                e_weighted = e_base * beta_w
-                icLoss_weighted = icLoss_base * gamma_w
-                bcLoss_weighted = bcLoss_base * delta_w
-
-                # 更新自适应权重（在 backward 之前）
-                if adapt_mode != 'fixed':
-                    loss_terms = [m_base, e_base, icLoss_base, bcLoss_base]
-                    adapt_weights.update(loss_terms, model)
-                    w = adapt_weights.weights
-                    alpha_w, beta_w, gamma_w, delta_w = w[0], w[1], w[2], w[3]
-                    m_weighted = m_base * alpha_w
-                    e_weighted = e_base * beta_w
-                    icLoss_weighted = icLoss_base * gamma_w
-                    bcLoss_weighted = bcLoss_base * delta_w
-
-                # 总损失
-                loss = data_loss + m_weighted + e_weighted + icLoss_weighted + bcLoss_weighted
+                # print(pde)
+                # print(loss_fn(outputs, real_outputs))
+                loss = loss_fn(outputs, real_outputs) + pde + icLoss + bcLoss
 
                 loss.backward()
                 optim.step()
@@ -343,21 +279,15 @@ def train():
                 training_loss += loss.item()
                 step += 1
 
-                print(f"已完成{step}/{len(train_dataloader)}训练，损失：{loss.item():.6f}")
-                print(f"  Data Loss: {data_loss.item():.6f}")
-                print(f"  Mass Loss: {m_weighted.item():.6f} (w={alpha_w.item():.6f})")
-                print(f"  Energy Loss: {e_weighted.item():.6f} (w={beta_w.item():.6f})")
-                print(f"  IC Loss: {icLoss_weighted.item():.6f} (w={gamma_w.item():.6f})")
-                print(f"  BC Loss: {bcLoss_weighted.item():.6f} (w={delta_w.item():.6f})")
+                print(f"已完成{step}/{len(train_dataloader)}训练，损失：{loss.item()}，其中PDE损失：{pde.item()}，占比：{pde.item() / loss.item() * 100.0:.2f}%（动量残差：{momentum.item()}），其中初始条件损失：{icLoss.item()}，占比：{icLoss.item() / loss.item() * 100.0:.2f}%，其中边界条件损失：{bcLoss.item()}，占比：{bcLoss.item() / loss.item() * 100.0:.2f}%")
                 training_loss_list.append(loss.item())
-                weights_history.append(adapt_weights.get_weights().tolist())
 
             # 验证
             with torch.no_grad():
                 validation_loss = 0.0
 
                 step = 0
-                for valids, valid_outputs, _ in valid_dataloader:
+                for valids, valid_outputs, _, _ in valid_dataloader:
                     valids = valids.to(device)
                     valid_outputs = valid_outputs.to(device)
                     validation = model(valids)
@@ -370,38 +300,31 @@ def train():
 
                     validation_loss_list.append(loss.item())
 
-                # Update the statistics for the best model
-                if validation_loss <= minimum_validation_loss:
-                    minimum_validation_loss = validation_loss
+                    # Update the statistics for the best model
+                    if validation_loss <= minimum_validation_loss:
+                        minimum_validation_loss = validation_loss
 
-                    # 保存当前模型
-                    torch.save(model.state_dict(), model_path)
-                    print("Model is now saved!")
-                    best_model_index = epoch
+                        # 保存当前模型
+                        torch.save(model.state_dict(), model_path)
+                        print("Model is now saved!")
+                        best_model_index = epoch
 
-                torch.save(model.state_dict(), f"./result/pifnn_{adapt_mode}_{i}.pth")
+                torch.save(model.state_dict(), f"./result/{run_name}_{i}.pth")
 
         # Training finished, print the statistics for the best model
         print('Training Finished')
-        torch.save(model.state_dict(), f"./result/pifnn_{adapt_mode}_final.pth")
+        torch.save(model.state_dict(), f"./result/{run_name}_final.pth")
 
         print("Best model has a validation loss of {} and it's in epoch {}".format(minimum_validation_loss,
                                                                                    best_model_index + 1))
 
-        train_file = open(f'./result/pifnn_{adapt_mode}_trainingData.txt', "w")
+        train_file = open(f'./result/{run_name}_trainingData.txt', "w")
         train_file.write(",".join([str(elem) for elem in training_loss_list]))
         train_file.close()
 
-        valid_file = open(f'./result/pifnn_{adapt_mode}_validationData.txt', "w")
+        valid_file = open(f'./result/{run_name}_validationData.txt', "w")
         valid_file.write(",".join([str(elem) for elem in validation_loss_list]))
         valid_file.close()
-
-        if adapt_mode != 'fixed':
-            weights_file = open(f'./result/pifnn_{adapt_mode}_weightsData.txt', "w")
-            for w in weights_history:
-                weights_file.write(",".join([str(elem) for elem in w]) + "\n")
-            weights_file.close()
-            print("Weights History saved!")
 
         print("Training Data saved!")
 
@@ -409,19 +332,13 @@ def train():
         print(traceback.format_exc())
         print(f"训练出错：{e}")
 
-        train_file = open(f'./result/pifnn_{adapt_mode}_trainingData.txt', "w")
+        train_file = open(f'./result/{run_name}_trainingData.txt', "w")
         train_file.write(",".join([str(elem) for elem in training_loss_list]))
         train_file.close()
 
-        valid_file = open(f'./result/pifnn_{adapt_mode}_validationData.txt', "w")
+        valid_file = open(f'./result/{run_name}_validationData.txt', "w")
         valid_file.write(",".join([str(elem) for elem in validation_loss_list]))
         valid_file.close()
-
-        if adapt_mode != 'fixed' and weights_history:
-            weights_file = open(f'./result/pifnn_{adapt_mode}_weightsData.txt', "w")
-            for w in weights_history:
-                weights_file.write(",".join([str(elem) for elem in w]) + "\n")
-            weights_file.close()
 
         print("Training Data saved!")
 
@@ -438,10 +355,12 @@ def bc_test():
     print(final_bc)
 
 # 测试函数
-def test(model_path: str):
+def test(model_path: str, run_name: str = None):
+    if run_name is None:
+        run_name = run_name_of(alpha, beta, gamma, delta, epsilon)
     model_dict = torch.load(model_path)
     # model = ConvAE(middle_channels, final_channels, kernal_size, stride).to(device)
-    model = FNN(7, 3).to(device)
+    model = FNN(7, 4).to(device)
 
     model.load_state_dict(model_dict)
     model.eval()
@@ -453,45 +372,23 @@ def test(model_path: str):
 
     test_loss = 0.0
 
-    os.makedirs(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test", exist_ok=True)
-    os.makedirs(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_convert", exist_ok=True)
+    os.makedirs(f"./result/{run_name}_test", exist_ok=True)
+    os.makedirs(f"./result/{run_name}_convert", exist_ok=True)
 
     with torch.no_grad():
         # 创建行和列的网格索引
         arr = []
         for x in range(0, 666, 6):
             for z in range(0, 606, 6):
-                arr.append([x, 600 - z, 217.5, 60.0, 45.0, 30.0, 3.17 * 1.0])
+                arr.append([x, 600 - z, 1.6, 32.5, 45.0, 67.5, 3.17 * 4.7])
 
         input_tensor = torch.from_numpy(np.array(arr, dtype=float)).float().to(device)
 
         fake_img = model(input_tensor)
         print(fake_img)
         fake = fake_img.cpu().numpy()[:, 0]
-
-        target_name = "TempHeat0645.0Age02Vel01.11350"
-
         # print(fake)
-        np.savetxt(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test/fake{target_name}.txt", [fake], fmt="%f", delimiter=" ")
-
-        # 读取文件
-        with open(f"{root_dir}/valid/output/{target_name}", 'r') as f:
-            content = f.read().strip()
-
-        # 替换逗号为换行
-        processed_content = content.replace(',', '\n')
-
-        # 写入临时文件
-        with open('temp_data.txt', 'w') as f:
-            f.write(processed_content)
-
-        # 加载真实数据
-        real_img = np.load(f"{root_dir}/valid/output/{target_name}")[:, 0]
-        print(real_img)
-
-        # 清理临时文件
-        os.remove('temp_data.txt')
-
+        np.savetxt(f"./result/{run_name}_test/fakeTempHeat0945.0Age09Vel98.300.txt", [fake], fmt="%f", delimiter=" ")
 
         '''
         for n, (real_img, real_output, file_name) in enumerate(test_dataloader, 0):
@@ -514,12 +411,13 @@ def test(model_path: str):
     print(f"Test loss: {test_loss / len(test_dataloader)}")
     '''
 
-
 # 测试函数
-def test_full(model_path: str):
+def test_full(model_path: str, run_name: str = None):
+    if run_name is None:
+        run_name = run_name_of(alpha, beta, gamma, delta, epsilon)
     model_dict = torch.load(model_path)
     # model = ConvAE(middle_channels, final_channels, kernal_size, stride).to(device)
-    model = FNN(7, 3).to(device)
+    model = FNN(7, 4).to(device)
 
     model.load_state_dict(model_dict)
     model.eval()
@@ -531,8 +429,8 @@ def test_full(model_path: str):
 
     test_loss = 0.0
 
-    os.makedirs(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test", exist_ok=True)
-    os.makedirs(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_convert", exist_ok=True)
+    os.makedirs(f"./result/{run_name}_test", exist_ok=True)
+    os.makedirs(f"./result/{run_name}_convert", exist_ok=True)
 
     with torch.no_grad():
 
@@ -541,7 +439,7 @@ def test_full(model_path: str):
         for inputs, real_outputs, file_name in tqdm(test_dataloader):
             
             # print(file_name[0])
-
+            
             input_tensor = inputs.to(device)
 
             fake_img = model(input_tensor)
@@ -556,17 +454,136 @@ def test_full(model_path: str):
             loss = loss_fn(fake_img[0], real_outputs[0])
             test_loss += loss.item()
             mse_arr.append([file_name[0], loss.item()])
-            print([file_name[0], loss.item()])
+            # print([file_name[0], loss.item()])
 
             # 保存对比文件
             input_data = inputs.cpu().numpy()[0]
+            # print(input_data)
             real = real_outputs.cpu().numpy()[0]
+            # print(real)
             fake = fake_img.cpu().numpy()[0]
-            np.savetxt(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test/input{file_name[0]}.txt", input_data, fmt="%f")
-            np.savetxt(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test/real{file_name[0]}.txt", real, fmt="%f")
-            np.savetxt(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test/fake{file_name[0]}.txt", fake, fmt="%f")
+            np.savetxt(f"./result/{run_name}_test/input{file_name[0]}.txt", input_data, fmt="%f")
+            np.savetxt(f"./result/{run_name}_test/real{file_name[0]}.txt", real, fmt="%f")
+            np.savetxt(f"./result/{run_name}_test/fake{file_name[0]}.txt", fake, fmt="%f")
 
-    np.savetxt(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_test/mse.txt", mse_arr, fmt="%s", delimiter=",")
+    np.savetxt(f"./result/{run_name}_test/mse.txt", mse_arr, fmt="%s", delimiter=",")
+    print(f"Test loss: {test_loss / len(test_dataloader)}")
+
+# 测试函数
+def test_full_20260607(model_path: str, run_name: str = None, tag: str = "20260607"):
+    if run_name is None:
+        run_name = run_name_of(alpha, beta, gamma, delta, epsilon)
+    model_dict = torch.load(model_path)
+    # model = ConvAE(middle_channels, final_channels, kernal_size, stride).to(device)
+    model = FNN(7, 4).to(device)
+
+    model.load_state_dict(model_dict)
+    model.eval()
+
+    test_dataset = FNNTestDataset(root_dir, f'test_{tag}')
+    test_dataloader = DataLoader(test_dataset, 1, shuffle=True, num_workers=workers)
+
+    loss_fn = nn.MSELoss().to(device)
+
+    test_loss = 0.0
+
+    os.makedirs(f"./result/{run_name}_{tag}_test", exist_ok=True)
+    os.makedirs(f"./result/{run_name}_{tag}_convert", exist_ok=True)
+
+    with torch.no_grad():
+
+        mse_arr = []
+
+        for inputs, real_outputs, file_name in tqdm(test_dataloader):
+            
+            # print(file_name[0])
+            
+            input_tensor = inputs.to(device)
+
+            fake_img = model(input_tensor)
+            # print(fake_img)
+            fake = fake_img.cpu().numpy()[:, 0]
+
+            inputs = inputs.to(device)
+            real_outputs = real_outputs.to(device)
+            # print(real_img.size())
+            fake_img = model(inputs)
+
+            loss = loss_fn(fake_img[0], real_outputs[0])
+            test_loss += loss.item()
+            mse_arr.append([file_name[0], loss.item()])
+            # print([file_name[0], loss.item()])
+
+            # 保存对比文件
+            input_data = inputs.cpu().numpy()[0]
+            # print(input_data)
+            real = real_outputs.cpu().numpy()[0]
+            # print(real)
+            fake = fake_img.cpu().numpy()[0]
+            np.savetxt(f"./result/{run_name}_{tag}_test/input{file_name[0]}.txt", input_data, fmt="%f")
+            np.savetxt(f"./result/{run_name}_{tag}_test/real{file_name[0]}.txt", real, fmt="%f")
+            np.savetxt(f"./result/{run_name}_{tag}_test/fake{file_name[0]}.txt", fake, fmt="%f")
+
+    np.savetxt(f"./result/{run_name}_{tag}_test/mse.txt", mse_arr, fmt="%s", delimiter=",")
+    print(f"Test loss: {test_loss / len(test_dataloader)}")
+
+
+# 测试函数
+def test_full_15000(model_path: str, run_name: str = None):
+    if run_name is None:
+        run_name = run_name_of(alpha, beta, gamma, delta, epsilon)
+    model_dict = torch.load(model_path)
+    # model = ConvAE(middle_channels, final_channels, kernal_size, stride).to(device)
+    model = FNN(7, 4).to(device)
+
+    model.load_state_dict(model_dict)
+    model.eval()
+
+    test_dataset = FNNTestDataset(root_dir, 'origin_new_15000')
+    test_dataloader = DataLoader(test_dataset, 1, shuffle=True, num_workers=workers)
+
+    loss_fn = nn.MSELoss().to(device)
+
+    test_loss = 0.0
+
+    os.makedirs(f"./result/{run_name}_15000_test", exist_ok=True)
+    os.makedirs(f"./result/{run_name}_15000_convert", exist_ok=True)
+
+    with torch.no_grad():
+
+        mse_arr = []
+
+        for inputs, real_outputs, file_name in tqdm(test_dataloader):
+            
+            # print(file_name[0])
+            
+            input_tensor = inputs.to(device)
+
+            fake_img = model(input_tensor)
+            # print(fake_img)
+            fake = fake_img.cpu().numpy()[:, 0]
+
+            inputs = inputs.to(device)
+            real_outputs = real_outputs.to(device)
+            # print(real_img.size())
+            fake_img = model(inputs)
+
+            loss = loss_fn(fake_img[0], real_outputs[0])
+            test_loss += loss.item()
+            mse_arr.append([file_name[0], loss.item()])
+            # print([file_name[0], loss.item()])
+
+            # 保存对比文件
+            input_data = inputs.cpu().numpy()[0]
+            # print(input_data)
+            real = real_outputs.cpu().numpy()[0]
+            # print(real)
+            fake = fake_img.cpu().numpy()[0]
+            np.savetxt(f"./result/{run_name}_15000_test/input{file_name[0]}.txt", input_data, fmt="%f")
+            np.savetxt(f"./result/{run_name}_15000_test/real{file_name[0]}.txt", real, fmt="%f")
+            np.savetxt(f"./result/{run_name}_15000_test/fake{file_name[0]}.txt", fake, fmt="%f")
+
+    np.savetxt(f"./result/{run_name}_15000_test/mse.txt", mse_arr, fmt="%s", delimiter=",")
     print(f"Test loss: {test_loss / len(test_dataloader)}")
 
 
@@ -574,7 +591,7 @@ def test_full(model_path: str):
 def predict(model_path: str):
     model_dict = torch.load(model_path)
     # model = ConvAE(middle_channels, final_channels, kernal_size, stride).to(device)
-    model = FNN(7, 3).to(device)
+    model = FNN(7, 4).to(device)
 
     model.load_state_dict(model_dict)
     model.eval()
@@ -610,7 +627,33 @@ def predict(model_path: str):
 
 
 if __name__ == "__main__":
-    train()
-    # test(f"./result/pifnn_{alpha}_{beta}_{gamma}_{delta}_final.pth")
-    # vpredict("./result/nn.pth")
+    # 一次传入多组权重，顺序完成各组的训练与验证，权重顺序：alpha,beta,gamma,delta,epsilon
+    #   python train_pifnn.py --weights 1.0,1.0,1.0,1.0,1.0 1.0,1.0,1.0,1.0,1e-8
+    # 加 --test 可在每组训练完成后自动执行 test_full 测试集评估（需存在 ./data/fnn/test）
+    parser = argparse.ArgumentParser(description="PIFNN 多组权重训练")
+    parser.add_argument("--weights", nargs="+", default=[f"{alpha},{beta},{gamma},{delta},{epsilon}"],
+                        help="一组或多组权重，格式 alpha,beta,gamma,delta,epsilon，多组用空格分隔")
+    parser.add_argument("--test", action="store_true",
+                        help="每组训练完成后对该模型执行 test_full（需存在 ./data/fnn/test）")
+    args = parser.parse_args()
+
+    for w in args.weights:
+        parts = w.split(",")
+        if len(parts) != 5:
+            raise ValueError(f"权重组格式错误：{w}，应为 alpha,beta,gamma,delta,epsilon 五个数")
+        a, b, g, d, e = (float(v) for v in parts)
+        run_name = run_name_of(a, b, g, d, e)
+        print(f"===== 开始权重组 {run_name} =====")
+        train(a, b, g, d, e)
+        if args.test:
+            if os.path.exists(f"{root_dir}/test"):
+                test_full(f"./result/{run_name}.pth", run_name)
+            else:
+                print(f"跳过测试：{root_dir}/test 不存在")
+
+    # 手动调用示例：
+    # test(f"./result/{run_name}.pth", run_name)
+    # test_full_20260607(f"./result/{run_name}.pth", run_name, "20260730")
+    # test_full_15000(f"./result/{run_name}.pth", run_name)
+    # predict("./result/nn.pth")
     # bc_test()
